@@ -33,6 +33,8 @@ import requests
 from urllib3.exceptions import InsecureRequestWarning
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+# 在文件顶部全局位置定义
+LINK_FILE_LOCK = threading.Lock()
 
 try:
     import tkinter as tk
@@ -165,7 +167,7 @@ def create_requests_session(cookies: Dict[str, str]) -> requests.Session:
 
 def append_link(link: str, output_dir: str, filename: str = Config.LINKS_FILENAME) -> None:
     path = Path(output_dir) / filename
-    with threading.Lock():
+    with LINK_FILE_LOCK:
         with open(path, "a", encoding="utf-8") as f:
             f.write(link + "\n")
 
@@ -666,19 +668,19 @@ class VimeoBrowserService:
             pass
         self.log("正在提取JWT...")
 
-        try:
-            token = page.evaluate("""
-                async () => {
-                    const resp = await fetch('/_next/jwt');
-                    const data = await resp.json();
-                    return data.token;
-                }
-            """)
-            if token:
-                self.log(f"JWT via fetch: {token[:50]}...")
-                return token
-        except Exception as e:
-            self.log(f"  fetch方式失败: {e}")
+        # try:
+        #     token = page.evaluate("""
+        #         async () => {
+        #             const resp = await fetch('/_next/jwt');
+        #             const data = await resp.json();
+        #             return data.token;
+        #         }
+        #     """)
+        #     if token:
+        #         self.log(f"JWT via fetch: {token[:50]}...")
+        #         return token
+        # except Exception as e:
+        #     self.log(f"  fetch方式失败: {e}")
 
         try:
             html = page.content()
