@@ -52,10 +52,13 @@ except ImportError:
 # 1. 常量配置
 # =============================================================================
 class Config:
-    CHUNK_SIZE: int = 2 * 1024 * 1024
+    CHUNK_SIZE: int = 10 * 1024 * 1024
     REQUEST_TIMEOUT: int = 300
     MAX_WAIT_AVAILABLE: int = 300
-    POLL_INTERVAL: int = 5
+    # POLL_INTERVAL: int = 5
+    POLL_BACKOFF_INITIAL: float = 2.0  # 新增：初始轮询间隔
+    POLL_BACKOFF_MAX: float = 30.0  # 新增：最大轮询间隔
+    POLL_BACKOFF_MULTIPLIER: float = 2.0  # 新增：退避乘数
     DEFAULT_PASSWORD: str = "Admin@coc1"
     EMAIL_USER_MIN: int = 9
     EMAIL_USER_MAX: int = 15
@@ -98,6 +101,20 @@ class TaskStoppedException(Exception):
 # =============================================================================
 # 3. 工具函数
 # =============================================================================
+DOMAIN_LIST = [
+    "qq.com",
+    "163.com",
+    "126.com",
+    "yeah.net",
+    "foxmail.com",
+    "139.com",
+    "189.cn",
+    "wo.cn",
+    "sina.com",
+    "outlook.com"
+]
+
+
 def random_qq_email() -> Tuple[str, str]:
     username = "".join(
         random.choices(
@@ -105,7 +122,7 @@ def random_qq_email() -> Tuple[str, str]:
             k=random.randint(Config.EMAIL_USER_MIN, Config.EMAIL_USER_MAX),
         )
     )
-    domain = "".join(random.choices(string.ascii_lowercase, k=Config.EMAIL_DOMAIN_LEN))
+    domain = random.choice(DOMAIN_LIST)
     return f"{username}@{domain}.com", username
 
 
@@ -286,11 +303,19 @@ class VimeoAPIService:
             f"?direction=desc&per_page=25&sort=last_user_action_event_date"
             f"&page=1&fields={fields}"
         )
-        for _ in range(Config.MAX_WAIT_AVAILABLE // Config.POLL_INTERVAL):
+
+        # 指数退避轮询
+        wait_time = Config.POLL_BACKOFF_INITIAL
+        elapsed = 0
+        while elapsed < Config.MAX_WAIT_AVAILABLE:
             self._check_stop()
-            time.sleep(Config.POLL_INTERVAL)
+            time.sleep(wait_time)
+            elapsed += wait_time
+
             resp = self._get(url)
             if resp.status_code != 200:
+                # 退避增长（带上限）
+                wait_time = min(wait_time * Config.POLL_BACKOFF_MULTIPLIER, Config.POLL_BACKOFF_MAX)
                 continue
             for item in resp.json().get("data", []):
                 vid = item.get("video", {}).get("uri", "").split("/")[-1]
@@ -300,6 +325,8 @@ class VimeoAPIService:
                         self._log(f"视频 {video_id} 已可用")
                         return True
                     self._log(f"视频状态: {status}，继续等待...")
+            # 退避增长（带上限）
+            wait_time = min(wait_time * Config.POLL_BACKOFF_MULTIPLIER, Config.POLL_BACKOFF_MAX)
         self._log("等待超时，视频未变为available")
         return False
 
@@ -410,29 +437,27 @@ class VimeoBrowserService:
         for attempt in range(3):
             self._check_stop()
             try:
-                page.goto("https://vimeo.com/join", timeout=60000, wait_until="domcontentloaded")
+                page.goto("https://vimeo.com/join", timeout=30000, wait_until="domcontentloaded")
                 break
             except Exception as e:
                 self.log(f"  导航尝试 {attempt + 1}/3 失败: {e}")
                 if attempt < 2:
-                    time.sleep(5)
+                    time.sleep(3)
         else:
             raise RuntimeError("无法加载注册页面")
 
+        # 条件等待替代固定sleep
         try:
-            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=15000)  # 新增：条件等待，最多15s
         except Exception:
             pass
-        page.wait_for_timeout(2000)
 
-        content = page.content()[:5000]
-        if "Just a moment" in content or "cf-challenge" in content:
+        try:
+            page.wait_for_selector("text=Just a moment", timeout=3000)
             self.log("检测到Cloudflare挑战，等待中...")
-            try:
-                page.wait_for_url("**/join**", timeout=30000)
-            except Exception:
-                pass
-            page.wait_for_timeout(3000)
+            page.wait_for_url("**/join**", timeout=20000)  # 缩短: 30s→20s
+        except Exception:
+            pass  # 没有挑战则直接继续
 
     def _fill_registration_form(self, page: Page, email: str, password: str, name: str) -> None:
         self.log("正在填写注册表单...")
@@ -447,8 +472,9 @@ class VimeoBrowserService:
         continue_btn.click()
         page.wait_for_timeout(3000)
 
+        # 条件等待：等待密码输入框出现（替代固定3秒）
         pw_inputs = page.locator('input[type="password"]')
-        pw_inputs.first.wait_for(state="visible", timeout=10000)
+        pw_inputs.first.wait_for(state="visible", timeout=8000)  # 新增
         pw_inputs.first.fill(password)
         if pw_inputs.count() > 1:
             pw_inputs.nth(1).fill(password)
@@ -459,7 +485,12 @@ class VimeoBrowserService:
 
         self._click_marketing_checkbox(page)
         self._click_submit_button(page)
-        page.wait_for_timeout(4000)
+
+        # 条件等待：等待URL离开注册页或出现survey（替代固定4秒）
+        try:
+            page.wait_for_url("**/survey**", timeout=10000)
+        except Exception:
+            page.wait_for_load_state("networkidle", timeout=5000)
 
         if "/join" in page.url and "/survey" not in page.url:
             self._check_registration_errors(page)
@@ -548,17 +579,37 @@ class VimeoBrowserService:
             self._dismiss_modals(page)
             self._fill_name_if_empty(page, name)
 
-            if self._click_button_by_texts(page, ["Skip", "跳过", "Skip for now", "Maybe later", "稍后", "Not now", "以后再说", "No thanks", "不用了"]):
-                page.wait_for_timeout(2500)
-                continue
-            if self._click_button_by_texts(page, ["Continue", "继续", "Next", "下一步", "Get started", "开始", "Join", "加入", "Sign up", "注册", "Start free trial", "免费试用"]):
-                page.wait_for_timeout(2500)
-                continue
-            if self._click_submit_or_any_button(page):
-                page.wait_for_timeout(2500)
-                continue
+            # if self._click_button_by_texts(page, ["Skip", "跳过", "Skip for now", "Maybe later", "稍后", "Not now", "以后再说", "No thanks", "不用了"]):
+            #     page.wait_for_timeout(2500)
+            #     continue
+            # if self._click_button_by_texts(page, ["Continue", "继续", "Next", "下一步", "Get started", "开始", "Join", "加入", "Sign up", "注册", "Start free trial", "免费试用"]):
+            #     page.wait_for_timeout(2500)
+            #     continue
+            # if self._click_submit_or_any_button(page):
+            #     page.wait_for_timeout(2500)
+            #     continue
+            #
+            # page.wait_for_timeout(2500)
+            # 先尝试快速点击，用短超时条件等待替代固定2.5秒
+            clicked = False
+            if self._click_button_by_texts(page, ["Skip", "跳过", "Skip for now", "Maybe later", "稍后", "Not now",
+                                                  "以后再说", "No thanks", "不用了"]):
+                clicked = True
+            elif self._click_button_by_texts(page, ["Continue", "继续", "Next", "下一步", "Get started", "开始", "Join",
+                                                    "加入", "Sign up", "注册", "Start free trial", "免费试用"]):
+                clicked = True
+            elif self._click_submit_or_any_button(page):
+                clicked = True
 
-            page.wait_for_timeout(2500)
+            if clicked:
+                # 条件等待替代固定sleep：等待网络空闲或URL变化，最多3秒
+                try:
+                    page.wait_for_load_state("networkidle", timeout=3000)
+                except Exception:
+                    pass
+            else:
+                # 无按钮可点时极短等待
+                page.wait_for_timeout(500)
 
     def _is_registration_flow_url(self, url: str) -> bool:
         keywords = ["survey", "paywall", "join", "upgrade", "billing", "subscribe", "plan", "pricing"]
@@ -608,7 +659,11 @@ class VimeoBrowserService:
         return False
 
     def _extract_jwt(self, page: Page) -> Optional[str]:
-        page.wait_for_timeout(2000)
+        # 条件等待替代固定2秒
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
         self.log("正在提取JWT...")
 
         try:
@@ -762,7 +817,11 @@ class SingleUploadTask:
                         self._log("🛑 等待期间收到停止信号")
                         break
                     time.sleep(1)
-
+        try:
+            session.close()
+            self._log("📤 账号所有上传任务完成，关闭HTTP会话")
+        except Exception:
+            pass
         self._log(f"\n✅ 任务完成，成功上传 {success_count}/{len(self.titles)} 个视频")
         return f"成功上传 {success_count} 个视频"
 
