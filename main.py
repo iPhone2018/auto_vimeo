@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Vimeo 批量注册 + 视频上传管理工具 - 修复版 v3
+Vimeo 批量注册 + 视频上传管理工具 - 人工校验等待版 v4
 ===============================================
+变更：hCaptcha人机验证不再直接失败
+- 脚本仅触发校验弹窗，不做任何自动识别/绕过
+- 日志提示用户手动完成验证码
+- 轮询检测校验完成，校验通过后自动继续注册流程
+- 最大超时保护，支持stop_event中断等待
 修复：注册完成后浏览器关闭导致程序停止的bug
-  - 原因：finally 中手动 _force_close() 与 with sync_playwright() 自动清理冲突
-  - 解决：移除 finally 手动关闭，让 with 语句自动管理；增加全面异常捕获
+- 原因：finally 中手动 _force_close() 与 with sync_playwright() 自动清理冲突
+- 解决：移除 finally 手动关闭，让 with 语句自动管理；增加全面异常捕获
 """
 
 from __future__ import annotations
@@ -49,7 +54,6 @@ except ImportError:
     print("需要安装 playwright: pip install playwright")
     sys.exit(1)
 
-
 # =============================================================================
 # 1. 常量配置
 # =============================================================================
@@ -57,10 +61,13 @@ class Config:
     CHUNK_SIZE: int = 10 * 1024 * 1024
     REQUEST_TIMEOUT: int = 300
     MAX_WAIT_AVAILABLE: int = 300
-    # POLL_INTERVAL: int = 5
-    POLL_BACKOFF_INITIAL: float = 2.0  # 新增：初始轮询间隔
-    POLL_BACKOFF_MAX: float = 30.0  # 新增：最大轮询间隔
-    POLL_BACKOFF_MULTIPLIER: float = 2.0  # 新增：退避乘数
+    POLL_BACKOFF_INITIAL: float = 2.0
+    POLL_BACKOFF_MAX: float = 30.0
+    POLL_BACKOFF_MULTIPLIER: float = 2.0
+    # 新增：人工验证码最大等待秒数
+    MAX_WAIT_MANUAL_CAPTCHA: int = 180
+    CAPTCHA_POLL_INTERVAL: float = 1.5
+
     DEFAULT_PASSWORD: str = "Admin@coc1"
     EMAIL_USER_MIN: int = 9
     EMAIL_USER_MAX: int = 15
@@ -76,7 +83,6 @@ class Config:
     VIDEO_EXTENSIONS: Tuple[str, ...] = (".mp4", ".mov", ".avi", ".mkv", ".wmv")
     LINKS_FILENAME: str = "links.txt"
 
-
 # =============================================================================
 # 2. 数据模型
 # =============================================================================
@@ -86,7 +92,6 @@ class VideoCreationResult:
     upload_link: str
     video_link: str
 
-
 @dataclass
 class UploadContext:
     session: requests.Session
@@ -95,10 +100,8 @@ class UploadContext:
     log: Callable[[str], None]
     stop_event: Optional[Event] = None
 
-
 class TaskStoppedException(Exception):
     pass
-
 
 # =============================================================================
 # 3. 工具函数
@@ -112,21 +115,26 @@ DOMAIN_LIST = [
     "139.com",
     "189.cn",
     "wo.cn",
-    "sina.com",
+    "sina.com.cn",
     "outlook.com"
 ]
 
 
 def random_qq_email() -> Tuple[str, str]:
-    username = "".join(
-        random.choices(
-            string.ascii_lowercase + string.digits,
-            k=random.randint(Config.EMAIL_USER_MIN, Config.EMAIL_USER_MAX),
-        )
-    )
+    """高熵随机邮箱，格式合法，依靠大随机空间实现几乎不重复，无内存池"""
+    EMAIL_USER_MIN = 8
+    EMAIL_USER_MAX = 14
+    # 首字符必须字母，过系统校验
+    first = random.choice(string.ascii_lowercase)
+    rest_len = random.randint(EMAIL_USER_MIN - 1, EMAIL_USER_MAX - 1)
+    rest = "".join(random.choices(
+        string.ascii_lowercase + string.digits + "_-",
+        k=rest_len
+    ))
+    username = first + rest
     domain = random.choice(DOMAIN_LIST)
-    return f"{username}@{domain}.com", username
-
+    email = f"{username}@{domain}"
+    return email, username
 
 def decode_jwt(jwt_str: Optional[str]) -> Tuple[Optional[str], str]:
     if not jwt_str:
@@ -138,7 +146,6 @@ def decode_jwt(jwt_str: Optional[str]) -> Tuple[Optional[str], str]:
         return str(payload.get("user_id")), str(payload.get("scopes", ""))[:60]
     except Exception:
         return None, ""
-
 
 def build_api_headers(jwt_token: str, accept: Optional[str] = None) -> Dict[str, str]:
     headers: Dict[str, str] = {
@@ -152,7 +159,6 @@ def build_api_headers(jwt_token: str, accept: Optional[str] = None) -> Dict[str,
     }
     return headers
 
-
 def create_requests_session(cookies: Dict[str, str]) -> requests.Session:
     session = requests.Session()
     session.headers.update({
@@ -164,19 +170,16 @@ def create_requests_session(cookies: Dict[str, str]) -> requests.Session:
         session.cookies.set(name, value, domain=".vimeo.com")
     return session
 
-
 def append_link(link: str, output_dir: str, filename: str = Config.LINKS_FILENAME) -> None:
     path = Path(output_dir) / filename
     with LINK_FILE_LOCK:
         with open(path, "a", encoding="utf-8") as f:
             f.write(link + "\n")
 
-
 def get_video_files(video_dir: str) -> List[str]:
     if not video_dir or not os.path.isdir(video_dir):
         return []
     return [f for f in os.listdir(video_dir) if f.lower().endswith(Config.VIDEO_EXTENSIONS)]
-
 
 # =============================================================================
 # 4. Vimeo API 服务层
@@ -306,7 +309,6 @@ class VimeoAPIService:
             f"&page=1&fields={fields}"
         )
 
-        # 指数退避轮询
         wait_time = Config.POLL_BACKOFF_INITIAL
         elapsed = 0
         while elapsed < Config.MAX_WAIT_AVAILABLE:
@@ -316,7 +318,6 @@ class VimeoAPIService:
 
             resp = self._get(url)
             if resp.status_code != 200:
-                # 退避增长（带上限）
                 wait_time = min(wait_time * Config.POLL_BACKOFF_MULTIPLIER, Config.POLL_BACKOFF_MAX)
                 continue
             for item in resp.json().get("data", []):
@@ -327,7 +328,6 @@ class VimeoAPIService:
                         self._log(f"视频 {video_id} 已可用")
                         return True
                     self._log(f"视频状态: {status}，继续等待...")
-            # 退避增长（带上限）
             wait_time = min(wait_time * Config.POLL_BACKOFF_MULTIPLIER, Config.POLL_BACKOFF_MAX)
         self._log("等待超时，视频未变为available")
         return False
@@ -377,9 +377,11 @@ class VimeoAPIService:
         self._log(f"描述更新状态: {resp.status_code}")
         return resp.status_code == 200
 
-
 # =============================================================================
-# 5. 浏览器自动化服务层 [v3 修复核心]
+# 5. 浏览器自动化服务层 [v4 人工校验等待逻辑]
+# =============================================================================
+# =============================================================================
+# 5. 浏览器自动化服务层 [v4‑fix 修复hCaptcha双iframe strict模式报错]
 # =============================================================================
 class VimeoBrowserService:
     def __init__(self, log_callback: Callable[[str], None], stop_event: Optional[Event] = None):
@@ -394,10 +396,6 @@ class VimeoBrowserService:
     def register_and_extract(
         self, email: str, password: str, name: str
     ) -> Tuple[Optional[str], Optional[Dict[str, str]], Optional[str]]:
-        """
-        [v3 修复] 不在 finally 中手动关闭 browser/context，
-        让 with sync_playwright() 自动管理生命周期，避免冲突导致异常覆盖返回值。
-        """
         jwt_token: Optional[str] = None
         cookies: Optional[Dict[str, str]] = None
         user_id: Optional[str] = None
@@ -430,7 +428,6 @@ class VimeoBrowserService:
             except Exception as e:
                 self.log(f"❌ 浏览器操作异常: {e}")
                 raise
-            # [v3 修复] 不手动关闭 browser/context，让 with 块自动释放
 
         return jwt_token, cookies, user_id
 
@@ -448,35 +445,74 @@ class VimeoBrowserService:
         else:
             raise RuntimeError("无法加载注册页面")
 
-        # 条件等待替代固定sleep
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)  # 新增：条件等待，最多15s
+            page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
 
         try:
             page.wait_for_selector("text=Just a moment", timeout=3000)
             self.log("检测到Cloudflare挑战，等待中...")
-            page.wait_for_url("**/join**", timeout=20000)  # 缩短: 30s→20s
+            page.wait_for_url("**/join**", timeout=20000)
         except Exception:
-            pass  # 没有挑战则直接继续
+            pass
+
+    def _wait_manual_captcha(self, page: Page) -> None:
+        """
+        修复版：只定位真实challenge iframe(title="hCaptcha challenge")
+        避开aria‑hidden占位iframe，杜绝strict mode violation
+        """
+        self.log("⚠️ 已触发hCaptcha人机验证，请**手动在浏览器完成验证码**，脚本等待校验完成...")
+        start_time = time.time()
+        # ✅ 只匹配真正的人机挑战弹窗iframe，过滤隐藏占位iframe
+        challenge_iframe = page.locator('iframe[title="hCaptcha challenge"]')
+
+        # 等待challenge iframe出现（说明弹出验证框）
+        try:
+            challenge_iframe.wait_for(timeout=30000)
+        except Exception:
+            # 极少数情况：hcaptcha无弹窗直接后台完成，直接返回
+            self.log("ℹ️ 未检测到hCaptcha弹窗，跳过人工等待")
+            return
+
+        # 轮询：等待iframe被页面移除 = 用户完成验证
+        while time.time() - start_time < Config.MAX_WAIT_MANUAL_CAPTCHA:
+            self._check_stop()
+            cnt = challenge_iframe.count()
+            if cnt == 0:
+                self.log("✅ 检测到人机验证已手动完成，继续注册流程")
+                # 给页面足够时间处理token、跳转，防止立刻填密码报错
+                page.wait_for_timeout(2500)
+                return
+            time.sleep(Config.CAPTCHA_POLL_INTERVAL)
+
+        raise RuntimeError(f"人工验证码等待超时 {Config.MAX_WAIT_MANUAL_CAPTCHA}s，任务失败")
 
     def _fill_registration_form(self, page: Page, email: str, password: str, name: str) -> None:
         self.log("正在填写注册表单...")
 
-        email_input = page.locator("#email_login")
-        email_input.wait_for(state="visible", timeout=10000)
+        email_input = page.locator("#unified_auth_email")
+        email_input.wait_for(state="visible", timeout=12000)
         email_input.fill(email)
+        self.log(f"  填入邮箱: {email}")
 
-        continue_btn = page.locator(
-            'button:has-text("通过电子邮件继续"), button:has-text("Continue with email")'
-        ).first
+        continue_btn = page.locator('button[form="unified_auth_email_form"]').first
+        continue_btn.wait_for(state="visible", timeout=8000)
         continue_btn.click()
-        page.wait_for_timeout(3000)
+        self.log("  点击邮箱提交按钮，跳转密码页...")
 
-        # 条件等待：等待密码输入框出现（替代固定3秒）
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+
+        # ========== 修复：用精准选择器判断是否出现hCaptcha挑战 ==========
+        challenge_iframe = page.locator('iframe[title="hCaptcha challenge"]')
+        if challenge_iframe.count() > 0:
+            self._wait_manual_captcha(page)
+
         pw_inputs = page.locator('input[type="password"]')
-        pw_inputs.first.wait_for(state="visible", timeout=8000)  # 新增
+        pw_inputs.first.wait_for(state="visible", timeout=12000)
         pw_inputs.first.fill(password)
         if pw_inputs.count() > 1:
             pw_inputs.nth(1).fill(password)
@@ -488,11 +524,10 @@ class VimeoBrowserService:
         self._click_marketing_checkbox(page)
         self._click_submit_button(page)
 
-        # 条件等待：等待URL离开注册页或出现survey（替代固定4秒）
         try:
-            page.wait_for_url("**/survey**", timeout=10000)
+            page.wait_for_url("**/survey**", timeout=12000)
         except Exception:
-            page.wait_for_load_state("networkidle", timeout=5000)
+            page.wait_for_load_state("networkidle", timeout=6000)
 
         if "/join" in page.url and "/survey" not in page.url:
             self._check_registration_errors(page)
@@ -581,18 +616,6 @@ class VimeoBrowserService:
             self._dismiss_modals(page)
             self._fill_name_if_empty(page, name)
 
-            # if self._click_button_by_texts(page, ["Skip", "跳过", "Skip for now", "Maybe later", "稍后", "Not now", "以后再说", "No thanks", "不用了"]):
-            #     page.wait_for_timeout(2500)
-            #     continue
-            # if self._click_button_by_texts(page, ["Continue", "继续", "Next", "下一步", "Get started", "开始", "Join", "加入", "Sign up", "注册", "Start free trial", "免费试用"]):
-            #     page.wait_for_timeout(2500)
-            #     continue
-            # if self._click_submit_or_any_button(page):
-            #     page.wait_for_timeout(2500)
-            #     continue
-            #
-            # page.wait_for_timeout(2500)
-            # 先尝试快速点击，用短超时条件等待替代固定2.5秒
             clicked = False
             if self._click_button_by_texts(page, ["Skip", "跳过", "Skip for now", "Maybe later", "稍后", "Not now",
                                                   "以后再说", "No thanks", "不用了"]):
@@ -604,13 +627,11 @@ class VimeoBrowserService:
                 clicked = True
 
             if clicked:
-                # 条件等待替代固定sleep：等待网络空闲或URL变化，最多3秒
                 try:
                     page.wait_for_load_state("networkidle", timeout=3000)
                 except Exception:
                     pass
             else:
-                # 无按钮可点时极短等待
                 page.wait_for_timeout(500)
 
     def _is_registration_flow_url(self, url: str) -> bool:
@@ -661,26 +682,11 @@ class VimeoBrowserService:
         return False
 
     def _extract_jwt(self, page: Page) -> Optional[str]:
-        # 条件等待替代固定2秒
         try:
             page.wait_for_load_state("networkidle", timeout=3000)
         except Exception:
             pass
         self.log("正在提取JWT...")
-
-        # try:
-        #     token = page.evaluate("""
-        #         async () => {
-        #             const resp = await fetch('/_next/jwt');
-        #             const data = await resp.json();
-        #             return data.token;
-        #         }
-        #     """)
-        #     if token:
-        #         self.log(f"JWT via fetch: {token[:50]}...")
-        #         return token
-        # except Exception as e:
-        #     self.log(f"  fetch方式失败: {e}")
 
         try:
             html = page.content()
@@ -709,7 +715,7 @@ class VimeoBrowserService:
 
 
 # =============================================================================
-# 6. 单次上传任务协调器 [v3 修复：增加全面异常捕获]
+# 6. 单次上传任务协调器
 # =============================================================================
 class SingleUploadTask:
     def __init__(
@@ -755,7 +761,6 @@ class SingleUploadTask:
         if not video_files:
             return "错误: 视频目录为空"
 
-        # 步骤1: 浏览器注册
         browser = VimeoBrowserService(log_callback=self._log, stop_event=self.stop_event)
         try:
             jwt_token, cookies, user_id = browser.register_and_extract(
@@ -773,7 +778,6 @@ class SingleUploadTask:
         self._log(f"✅ 注册完成，jwt={jwt_token[:30]}..., user_id={user_id}")
         self._log(f"📤 准备上传 {len(self.titles)} 个视频...")
 
-        # 步骤2: 创建API会话
         try:
             session = create_requests_session(cookies)
             ctx = UploadContext(
@@ -785,7 +789,6 @@ class SingleUploadTask:
             self._log(f"❌ 创建API会话失败: {e}")
             return f"错误: API会话创建失败 - {e}"
 
-        # 步骤3: 逐条上传
         success_count = 0
         for idx, (title, intro) in enumerate(zip(self.titles, self.intros), 1):
             if self.stop_event and self.stop_event.is_set():
@@ -811,7 +814,6 @@ class SingleUploadTask:
 
             success_count += 1
 
-            # 每次上传后等待 interval 秒（最后一个不等待）
             if idx < len(self.titles):
                 self._log(f"⏳ 等待 {self.interval} 秒后继续...")
                 for _ in range(self.interval):
@@ -846,7 +848,6 @@ class SingleUploadTask:
         self._log(f"🔗 视频地址: {creation.video_link}")
         append_link(creation.video_link, self.output_dir)
         return True
-
 
 # =============================================================================
 # 7. 任务调度器
@@ -995,6 +996,7 @@ class TaskScheduler:
         self._log(f"   并发数: {self.thread_count}")
         self._log(f"   发布间隔: {self.interval} 秒（每次上传一个视频后等待）")
         self._log(f"   单账号上限: {self.max_pub} 个视频")
+        self._log(f"   人工验证码最大等待: {Config.MAX_WAIT_MANUAL_CAPTCHA} 秒")
         self._log("=" * 60)
 
     def _load_titles(self) -> List[str]:
@@ -1072,14 +1074,13 @@ class TaskScheduler:
         self.stop_event.clear()
         self.pause_event.clear()
 
-
 # =============================================================================
 # 8. GUI 构建器
 # =============================================================================
 class VimeoGUI:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Vimeo 批量注册工具 - 修复版 v3")
+        self.root.title("Vimeo 批量注册工具 - 人工校验版 v4")
         self.root.geometry("1100x900")
         self.root.minsize(1000, 800)
 
@@ -1112,6 +1113,7 @@ class VimeoGUI:
         self._build_status_bar()
 
         self._add_log("工具已启动，请依次选择目录并勾选文件后点击「启动」")
+        self._add_log("提示：遇到hCaptcha时，请手动在弹出Chrome浏览器完成验证码，脚本会自动继续")
 
     def _build_header(self) -> None:
         frame = tk.Frame(self.root, bg="#2c5aa0")
@@ -1135,7 +1137,7 @@ class VimeoGUI:
         self._add_dir_row(cfg, "输出目录:", self.output_dir_var, None)
 
     def _add_number_input(self, parent: tk.Widget, label: str, min_v: int, max_v: int,
-                         default: int, hint: str, width: int = 10) -> tk.Spinbox:
+                          default: int, hint: str, width: int = 10) -> tk.Spinbox:
         tk.Label(parent, text=label, font=("微软雅黑", 10, "bold"), width=width, anchor=tk.W).pack(side=tk.LEFT)
         spin = tk.Spinbox(parent, from_=min_v, to=max_v, width=8, font=("微软雅黑", 10))
         spin.pack(side=tk.LEFT, padx=5)
