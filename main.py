@@ -414,8 +414,8 @@ class VimeoBrowserService:
                 self._check_stop()
                 self._fill_registration_form(page, email, password, name)
                 self._check_stop()
-                self._handle_post_registration_flow(page, name)
-                self._check_stop()
+                # self._handle_post_registration_flow(page, name)
+                # self._check_stop()
 
                 jwt_token = self._extract_jwt(page)
                 cookies = {c["name"]: c["value"] for c in context.cookies()}
